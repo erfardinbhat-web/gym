@@ -8,10 +8,12 @@ const cloudinary = require('./cloudinary');
 const { auth } = require('./middleware');
 require('dotenv').config();
 
+router.use(express.json());
+router.use(express.urlencoded({ extended: true }));
+
 const storage = multer.memoryStorage();
 const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
 
-// Upload image to Cloudinary
 async function uploadToCloudinary(buffer, folder) {
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
@@ -25,12 +27,51 @@ async function uploadToCloudinary(buffer, folder) {
   });
 }
 
-// Register gym
+function formatDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt)) return String(d);
+  return dt.toISOString().slice(0, 10);
+}
+
+// Response shape the Flutter Member model expects (snake_case)
+function serializeMember(m) {
+  return {
+    id: m.id,
+    member_code: m.member_code,
+    gym_id: m.gym_id,
+    name: m.name,
+    parentage: m.parentage,
+    address: m.address,
+    phone: m.phone,
+    gender: m.gender,
+    joined_on: formatDate(m.joined_on),
+    photo_url: m.photo_url,
+    aadhaar_url: m.aadhaar_url,
+  };
+}
+
+function signToken(gymId) {
+  return jwt.sign(
+    { gymId, userId: gymId },
+    process.env.JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+// ---------- AUTH ----------
+
 router.post('/auth/register', async (req, res) => {
   try {
-    const { gymName, email, password } = req.body;
+    const body = req.body || {};
+    const gymName = (body.gym_name || body.gymName || body.name || '').trim();
+    const email = (body.email || '').trim().toLowerCase();
+    const password = body.password || '';
+
     if (!gymName || !email || !password)
       return res.status(400).json({ ok: false, error: 'All fields required' });
+    if (password.length < 6)
+      return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
 
     const [existing] = await pool.query('SELECT id FROM gyms WHERE email = ?', [email]);
     if (existing.length > 0)
@@ -42,22 +83,22 @@ router.post('/auth/register', async (req, res) => {
       [gymName, email, hashed]
     );
 
-    const token = jwt.sign(
-      { gymId: result.insertId, userId: result.insertId },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    res.json({ ok: true, token, gymId: result.insertId, gymName });
+    res.status(200).json({
+      ok: true,
+      token: signToken(result.insertId),
+      gym: { id: result.insertId, gym_name: gymName, email },
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Login gym
 router.post('/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const body = req.body || {};
+    const email = (body.email || '').trim().toLowerCase();
+    const password = body.password || '';
+
     if (!email || !password)
       return res.status(400).json({ ok: false, error: 'Email and password required' });
 
@@ -70,25 +111,38 @@ router.post('/auth/login', async (req, res) => {
     if (!valid)
       return res.status(401).json({ ok: false, error: 'Invalid email or password' });
 
-    const token = jwt.sign(
-      { gymId: gym.id, userId: gym.id },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    res.json({ ok: true, token, gymId: gym.id, gymName: gym.name });
+    res.json({
+      ok: true,
+      token: signToken(gym.id),
+      gym: { id: gym.id, gym_name: gym.name, email: gym.email },
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Create member
-router.post('/members', auth, upload.fields([
+// ---------- MEMBERS ----------
+
+const memberFiles = upload.fields([
   { name: 'photo', maxCount: 1 },
-  { name: 'aadhaar', maxCount: 1 }
-]), async (req, res) => {
+  { name: 'aadhaar', maxCount: 1 },
+]);
+
+function readMemberBody(body) {
+  body = body || {};
+  return {
+    name: (body.name || '').trim(),
+    parentage: (body.parentage || '').trim(),
+    address: (body.address || '').trim(),
+    phone: (body.phone || '').trim(),
+    gender: (body.gender || '').trim(),
+    joinedOn: (body.joined_on || body.joinedOn || '').trim(),
+  };
+}
+
+router.post('/members', auth, memberFiles, async (req, res) => {
   try {
-    const { name, parentage, address, phone, gender, joinedOn } = req.body;
+    const { name, parentage, address, phone, gender, joinedOn } = readMemberBody(req.body);
     const gymId = req.gymId;
 
     if (!name || !parentage || !address || !phone || !gender || !joinedOn)
@@ -102,87 +156,71 @@ router.post('/members', auth, upload.fields([
       return res.status(400).json({ ok: false, error: 'Phone number already registered' });
 
     const [last] = await pool.query(
-      'SELECT member_code FROM members WHERE gym_id = ? ORDER BY created_at DESC LIMIT 1',
+      'SELECT member_code FROM members WHERE gym_id = ? ORDER BY id DESC LIMIT 1',
       [gymId]
     );
     let nextNum = 1;
     if (last.length > 0) {
-      const lastNum = parseInt(last[0].member_code.replace(/[^0-9]/g, '')) || 0;
+      const lastNum = parseInt(String(last[0].member_code).replace(/[^0-9]/g, '')) || 0;
       nextNum = lastNum + 1;
     }
     const memberCode = 'GYM-' + String(nextNum).padStart(4, '0');
 
     let photoUrl = null;
     let aadhaarUrl = null;
+    if (req.files?.photo) photoUrl = await uploadToCloudinary(req.files.photo[0].buffer, 'photos');
+    if (req.files?.aadhaar) aadhaarUrl = await uploadToCloudinary(req.files.aadhaar[0].buffer, 'aadhaar');
 
-    if (req.files?.photo) {
-      photoUrl = await uploadToCloudinary(req.files.photo[0].buffer, 'photos');
-    }
-    if (req.files?.aadhaar) {
-      aadhaarUrl = await uploadToCloudinary(req.files.aadhaar[0].buffer, 'aadhaar');
-    }
-
-    await pool.query(
+    const [result] = await pool.query(
       'INSERT INTO members (gym_id, member_code, name, parentage, address, phone, gender, joined_on, photo_url, aadhaar_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       [gymId, memberCode, name, parentage, address, phone, gender, joinedOn, photoUrl, aadhaarUrl]
     );
 
-    res.json({ ok: true, memberCode });
+    const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [result.insertId]);
+    res.status(201).json({ ok: true, member: serializeMember(rows[0]) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// List members
 router.get('/members', auth, async (req, res) => {
   try {
-    const { search = '', page = 1, pageSize = 25 } = req.query;
-    const gymId = req.gymId;
+    const search = (req.query.search || '').trim();
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const pageSize = Math.min(100, parseInt(req.query.page_size || req.query.pageSize) || 25);
     const offset = (page - 1) * pageSize;
+    const gymId = req.gymId;
 
-    let query = 'SELECT * FROM members WHERE gym_id = ?';
-    let countQuery = 'SELECT COUNT(*) as total FROM members WHERE gym_id = ?';
+    let where = 'WHERE gym_id = ?';
     const params = [gymId];
-
     if (search) {
-      query += ' AND (name LIKE ? OR phone LIKE ? OR member_code LIKE ?)';
-      countQuery += ' AND (name LIKE ? OR phone LIKE ? OR member_code LIKE ?)';
+      where += ' AND (name LIKE ? OR phone LIKE ? OR member_code LIKE ?)';
       const term = `%${search}%`;
       params.push(term, term, term);
     }
 
-    query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(pageSize), parseInt(offset));
-
-    const [members] = await pool.query(query, params);
-    const [countResult] = await pool.query(countQuery, params.slice(0, -2));
+    const [members] = await pool.query(
+      `SELECT * FROM members ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      [...params, pageSize, offset]
+    );
+    const [countResult] = await pool.query(
+      `SELECT COUNT(*) AS total FROM members ${where}`,
+      params
+    );
     const total = countResult[0].total;
 
     res.json({
       ok: true,
-      members: members.map(m => ({
-        memberId: m.id.toString(),
-        memberCode: m.member_code,
-        gymId: m.gym_id.toString(),
-        name: m.name,
-        phone: m.phone,
-        gender: m.gender,
-        joinedOn: m.joined_on ? new Date(m.joined_on).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '',
-        parentage: m.parentage,
-        address: m.address,
-        photoUrl: m.photo_url,
-        aadhaarUrl: m.aadhaar_url,
-      })),
+      members: members.map(serializeMember),
       total,
-      page: parseInt(page),
-      hasMore: offset + parseInt(pageSize) < total,
+      page,
+      has_more: offset + members.length < total,
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Get single member
 router.get('/members/:id', auth, async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -192,36 +230,19 @@ router.get('/members/:id', auth, async (req, res) => {
     if (rows.length === 0)
       return res.status(404).json({ ok: false, error: 'Member not found' });
 
-    const m = rows[0];
-    res.json({
-      ok: true,
-      member: {
-        memberId: m.id.toString(),
-        memberCode: m.member_code,
-        gymId: m.gym_id.toString(),
-        name: m.name,
-        phone: m.phone,
-        gender: m.gender,
-        joinedOn: m.joined_on ? new Date(m.joined_on).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '',
-        parentage: m.parentage,
-        address: m.address,
-        photoUrl: m.photo_url,
-        aadhaarUrl: m.aadhaar_url,
-      }
-    });
+    res.json(serializeMember(rows[0]));
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Update member
-router.put('/members/:id', auth, upload.fields([
-  { name: 'photo', maxCount: 1 },
-  { name: 'aadhaar', maxCount: 1 }
-]), async (req, res) => {
+router.put('/members/:id', auth, memberFiles, async (req, res) => {
   try {
-    const { name, parentage, address, phone, gender, joinedOn } = req.body;
+    const { name, parentage, address, phone, gender, joinedOn } = readMemberBody(req.body);
     const gymId = req.gymId;
+
+    if (!name || !parentage || !address || !phone || !gender || !joinedOn)
+      return res.status(400).json({ ok: false, error: 'All fields required' });
 
     const [existing] = await pool.query(
       'SELECT id FROM members WHERE id = ? AND gym_id = ?',
@@ -239,31 +260,25 @@ router.put('/members/:id', auth, upload.fields([
 
     let photoUrl = null;
     let aadhaarUrl = null;
-
-    if (req.files?.photo) {
-      photoUrl = await uploadToCloudinary(req.files.photo[0].buffer, 'photos');
-    }
-    if (req.files?.aadhaar) {
-      aadhaarUrl = await uploadToCloudinary(req.files.aadhaar[0].buffer, 'aadhaar');
-    }
+    if (req.files?.photo) photoUrl = await uploadToCloudinary(req.files.photo[0].buffer, 'photos');
+    if (req.files?.aadhaar) aadhaarUrl = await uploadToCloudinary(req.files.aadhaar[0].buffer, 'aadhaar');
 
     let query = 'UPDATE members SET name=?, parentage=?, address=?, phone=?, gender=?, joined_on=?';
     const params = [name, parentage, address, phone, gender, joinedOn];
-
     if (photoUrl) { query += ', photo_url=?'; params.push(photoUrl); }
     if (aadhaarUrl) { query += ', aadhaar_url=?'; params.push(aadhaarUrl); }
-
     query += ' WHERE id=? AND gym_id=?';
     params.push(req.params.id, gymId);
 
     await pool.query(query, params);
-    res.json({ ok: true });
+
+    const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [req.params.id]);
+    res.json({ ok: true, member: serializeMember(rows[0]) });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Delete member
 router.delete('/members/:id', auth, async (req, res) => {
   try {
     const [existing] = await pool.query(

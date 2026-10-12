@@ -69,13 +69,13 @@ router.post('/auth/register', async (req, res) => {
     const password = body.password || '';
 
     if (!gymName || !email || !password)
-      return res.status(400).json({ ok: false, error: 'All fields required' });
+      return res.status(400).json({ error: 'All fields required' });
     if (password.length < 6)
-      return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
 
     const [existing] = await pool.query('SELECT id FROM gyms WHERE email = ?', [email]);
     if (existing.length > 0)
-      return res.status(400).json({ ok: false, error: 'Email already registered' });
+      return res.status(400).json({ error: 'Email already registered' });
 
     const hashed = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
@@ -84,12 +84,15 @@ router.post('/auth/register', async (req, res) => {
     );
 
     res.status(200).json({
-      ok: true,
+      gym: {
+        id: result.insertId,
+        gym_name: gymName,
+        email
+      },
       token: signToken(result.insertId),
-      gym: { id: result.insertId, gym_name: gymName, email },
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -100,24 +103,27 @@ router.post('/auth/login', async (req, res) => {
     const password = body.password || '';
 
     if (!email || !password)
-      return res.status(400).json({ ok: false, error: 'Email and password required' });
+      return res.status(400).json({ error: 'Email and password required' });
 
     const [rows] = await pool.query('SELECT * FROM gyms WHERE email = ?', [email]);
     if (rows.length === 0)
-      return res.status(401).json({ ok: false, error: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Invalid email or password' });
 
     const gym = rows[0];
     const valid = await bcrypt.compare(password, gym.password);
     if (!valid)
-      return res.status(401).json({ ok: false, error: 'Invalid email or password' });
+      return res.status(401).json({ error: 'Invalid email or password' });
 
     res.json({
-      ok: true,
+      gym: {
+        id: gym.id,
+        gym_name: gym.name,
+        email: gym.email,
+      },
       token: signToken(gym.id),
-      gym: { id: gym.id, gym_name: gym.name, email: gym.email },
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -146,14 +152,14 @@ router.post('/members', auth, memberFiles, async (req, res) => {
     const gymId = req.gymId;
 
     if (!name || !parentage || !address || !phone || !gender || !joinedOn)
-      return res.status(400).json({ ok: false, error: 'All fields required' });
+      return res.status(400).json({ error: 'All fields required' });
 
     const [existing] = await pool.query(
       'SELECT id FROM members WHERE phone = ? AND gym_id = ?',
       [phone, gymId]
     );
     if (existing.length > 0)
-      return res.status(400).json({ ok: false, error: 'Phone number already registered' });
+      return res.status(400).json({ error: 'Phone number already registered' });
 
     const [last] = await pool.query(
       'SELECT member_code FROM members WHERE gym_id = ? ORDER BY id DESC LIMIT 1',
@@ -177,9 +183,9 @@ router.post('/members', auth, memberFiles, async (req, res) => {
     );
 
     const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [result.insertId]);
-    res.status(201).json({ ok: true, member: serializeMember(rows[0]) });
+    res.status(201).json(serializeMember(rows[0]));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -210,14 +216,13 @@ router.get('/members', auth, async (req, res) => {
     const total = countResult[0].total;
 
     res.json({
-      ok: true,
       members: members.map(serializeMember),
       total,
       page,
       has_more: offset + members.length < total,
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -228,11 +233,11 @@ router.get('/members/:id', auth, async (req, res) => {
       [req.params.id, req.gymId]
     );
     if (rows.length === 0)
-      return res.status(404).json({ ok: false, error: 'Member not found' });
+      return res.status(404).json({ error: 'Member not found' });
 
     res.json(serializeMember(rows[0]));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -242,21 +247,21 @@ router.put('/members/:id', auth, memberFiles, async (req, res) => {
     const gymId = req.gymId;
 
     if (!name || !parentage || !address || !phone || !gender || !joinedOn)
-      return res.status(400).json({ ok: false, error: 'All fields required' });
+      return res.status(400).json({ error: 'All fields required' });
 
     const [existing] = await pool.query(
       'SELECT id FROM members WHERE id = ? AND gym_id = ?',
       [req.params.id, gymId]
     );
     if (existing.length === 0)
-      return res.status(404).json({ ok: false, error: 'Member not found' });
+      return res.status(404).json({ error: 'Member not found' });
 
     const [phoneCheck] = await pool.query(
       'SELECT id FROM members WHERE phone = ? AND gym_id = ? AND id != ?',
       [phone, gymId, req.params.id]
     );
     if (phoneCheck.length > 0)
-      return res.status(400).json({ ok: false, error: 'Phone already used by another member' });
+      return res.status(400).json({ error: 'Phone already used by another member' });
 
     let photoUrl = null;
     let aadhaarUrl = null;
@@ -273,9 +278,9 @@ router.put('/members/:id', auth, memberFiles, async (req, res) => {
     await pool.query(query, params);
 
     const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [req.params.id]);
-    res.json({ ok: true, member: serializeMember(rows[0]) });
+    res.json(serializeMember(rows[0]));
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -286,12 +291,12 @@ router.delete('/members/:id', auth, async (req, res) => {
       [req.params.id, req.gymId]
     );
     if (existing.length === 0)
-      return res.status(404).json({ ok: false, error: 'Member not found' });
+      return res.status(404).json({ error: 'Member not found' });
 
     await pool.query('DELETE FROM members WHERE id = ? AND gym_id = ?', [req.params.id, req.gymId]);
-    res.json({ ok: true });
+    res.json({ message: 'Member deleted successfully' });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ error: e.message });
   }
 });
 

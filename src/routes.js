@@ -183,7 +183,7 @@ router.post('/members', auth, memberFiles, async (req, res) => {
     );
 
     const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [result.insertId]);
-    res.status(201).json(serializeMember(rows[0]));
+    res.status(201).json({ member: serializeMember(rows[0]) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -278,7 +278,7 @@ router.put('/members/:id', auth, memberFiles, async (req, res) => {
     await pool.query(query, params);
 
     const [rows] = await pool.query('SELECT * FROM members WHERE id = ?', [req.params.id]);
-    res.json(serializeMember(rows[0]));
+    res.json({ member: serializeMember(rows[0]) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

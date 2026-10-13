@@ -127,6 +127,46 @@ router.post('/auth/login', async (req, res) => {
   }
 });
 
+router.put('/auth/profile', auth, async (req, res) => {
+  try {
+    const gymName = ((req.body || {}).gym_name || '').trim();
+    if (!gymName)
+      return res.status(400).json({ error: 'Gym name is required' });
+
+    await pool.query('UPDATE gyms SET name = ? WHERE id = ?', [gymName, req.gymId]);
+    res.json({ gym: { id: req.gymId, gym_name: gymName } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put('/auth/password', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const currentPassword = body.current_password || '';
+    const newPassword = body.new_password || '';
+
+    if (!currentPassword || !newPassword)
+      return res.status(400).json({ error: 'All fields required' });
+    if (newPassword.length < 6)
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const [rows] = await pool.query('SELECT password FROM gyms WHERE id = ?', [req.gymId]);
+    if (rows.length === 0)
+      return res.status(404).json({ error: 'Gym not found' });
+
+    const valid = await bcrypt.compare(currentPassword, rows[0].password);
+    if (!valid)
+      return res.status(400).json({ error: 'Current password is incorrect' });
+
+    const hashed = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE gyms SET password = ? WHERE id = ?', [hashed, req.gymId]);
+    res.json({ message: 'Password updated' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---------- MEMBERS ----------
 
 const memberFiles = upload.fields([

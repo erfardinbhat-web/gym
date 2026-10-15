@@ -340,4 +340,244 @@ router.delete('/members/:id', auth, async (req, res) => {
   }
 });
 
+// ---------- PLANS ----------
+
+const planFile = upload.single('qr');
+
+function serializePlan(p) {
+  return {
+    id: p.id,
+    name: p.name,
+    amount: Number(p.amount),
+    duration_months: p.duration_months,
+    payment_link: p.payment_link,
+    qr_url: p.qr_url,
+  };
+}
+
+function readPlanBody(body) {
+  body = body || {};
+  return {
+    name: (body.name || '').trim(),
+    amount: Number(body.amount),
+    duration: parseInt(body.duration_months, 10),
+    link: (body.payment_link || '').trim(),
+    removeQr: body.remove_qr === 'true',
+  };
+}
+
+function planError(p) {
+  if (!p.name) return 'Plan name is required';
+  if (!Number.isFinite(p.amount) || p.amount <= 0 || p.amount >= 100000000)
+    return 'Enter a valid amount';
+  if (!Number.isInteger(p.duration) || p.duration < 1 || p.duration > 60)
+    return 'Duration must be 1 to 60 months';
+  if (p.link && (p.link.length > 500 || !/^https?:\/\//i.test(p.link)))
+    return 'Payment link must start with http:// or https://';
+  return null;
+}
+
+router.get('/plans', auth, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM plans WHERE gym_id = ? ORDER BY amount ASC, id ASC',
+      [req.gymId]
+    );
+    res.json({ plans: rows.map(serializePlan) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/plans', auth, planFile, async (req, res) => {
+  try {
+    const p = readPlanBody(req.body);
+    const err = planError(p);
+    if (err) return res.status(400).json({ error: err });
+
+    let qrUrl = null;
+    if (req.file) qrUrl = await uploadToCloudinary(req.file.buffer, 'qr');
+
+    const [result] = await pool.query(
+      'INSERT INTO plans (gym_id, name, amount, duration_months, payment_link, qr_url) VALUES (?, ?, ?, ?, ?, ?)',
+      [req.gymId, p.name, p.amount, p.duration, p.link || null, qrUrl]
+    );
+    const [rows] = await pool.query('SELECT * FROM plans WHERE id = ?', [result.insertId]);
+    res.status(201).json({ plan: serializePlan(rows[0]) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put('/plans/:id', auth, planFile, async (req, res) => {
+  try {
+    const p = readPlanBody(req.body);
+    const err = planError(p);
+    if (err) return res.status(400).json({ error: err });
+
+    const [existing] = await pool.query(
+      'SELECT id FROM plans WHERE id = ? AND gym_id = ?',
+      [req.params.id, req.gymId]
+    );
+    if (existing.length === 0)
+      return res.status(404).json({ error: 'Plan not found' });
+
+    let query = 'UPDATE plans SET name=?, amount=?, duration_months=?, payment_link=?';
+    const params = [p.name, p.amount, p.duration, p.link || null];
+    if (req.file) {
+      query += ', qr_url=?';
+      params.push(await uploadToCloudinary(req.file.buffer, 'qr'));
+    } else if (p.removeQr) {
+      query += ', qr_url=NULL';
+    }
+    query += ' WHERE id=? AND gym_id=?';
+    params.push(req.params.id, req.gymId);
+    await pool.query(query, params);
+
+    const [rows] = await pool.query('SELECT * FROM plans WHERE id = ?', [req.params.id]);
+    res.json({ plan: serializePlan(rows[0]) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/plans/:id', auth, async (req, res) => {
+  try {
+    const [result] = await pool.query(
+      'DELETE FROM plans WHERE id = ? AND gym_id = ?',
+      [req.params.id, req.gymId]
+    );
+    if (result.affectedRows === 0)
+      return res.status(404).json({ error: 'Plan not found' });
+    res.json({ message: 'Plan deleted' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- PAYMENTS ----------
+
+function isValidDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(s + 'T00:00:00Z');
+  return !isNaN(d) && d.toISOString().slice(0, 10) === s;
+}
+
+function addMonths(dateStr, months) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const target = new Date(Date.UTC(y, m - 1 + months, 1));
+  const lastDay = new Date(
+    Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)
+  ).getUTCDate();
+  target.setUTCDate(Math.min(d, lastDay));
+  return target.toISOString().slice(0, 10);
+}
+
+const PAYMENT_COLUMNS = `id, plan_id, plan_name, amount,
+  DATE_FORMAT(paid_on, '%Y-%m-%d') AS paid_on,
+  DATE_FORMAT(valid_until, '%Y-%m-%d') AS valid_until, note`;
+
+function serializePayment(p) {
+  return {
+    id: p.id,
+    plan_id: p.plan_id,
+    plan_name: p.plan_name,
+    amount: Number(p.amount),
+    paid_on: p.paid_on,
+    valid_until: p.valid_until,
+    note: p.note,
+  };
+}
+
+async function memberBelongsToGym(memberId, gymId) {
+  const [rows] = await pool.query(
+    'SELECT id FROM members WHERE id = ? AND gym_id = ?',
+    [memberId, gymId]
+  );
+  return rows.length > 0;
+}
+
+router.get('/members/:id/payments', auth, async (req, res) => {
+  try {
+    if (!(await memberBelongsToGym(req.params.id, req.gymId)))
+      return res.status(404).json({ error: 'Member not found' });
+
+    const [rows] = await pool.query(
+      `SELECT ${PAYMENT_COLUMNS} FROM payments
+       WHERE member_id = ? AND gym_id = ?
+       ORDER BY paid_on DESC, id DESC`,
+      [req.params.id, req.gymId]
+    );
+    const payments = rows.map(serializePayment);
+    const validUntil = payments.reduce(
+      (max, p) => (!max || p.valid_until > max ? p.valid_until : max),
+      null
+    );
+    res.json({ payments, valid_until: validUntil });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/members/:id/payments', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const planId = parseInt(body.plan_id, 10);
+    const note = (body.note || '').trim().slice(0, 255);
+    const paidOn = (body.paid_on || new Date().toISOString().slice(0, 10)).trim();
+
+    if (!planId) return res.status(400).json({ error: 'Select a plan' });
+    if (!isValidDate(paidOn))
+      return res.status(400).json({ error: 'Invalid payment date' });
+    if (!(await memberBelongsToGym(req.params.id, req.gymId)))
+      return res.status(404).json({ error: 'Member not found' });
+
+    const [plans] = await pool.query(
+      'SELECT * FROM plans WHERE id = ? AND gym_id = ?',
+      [planId, req.gymId]
+    );
+    if (plans.length === 0)
+      return res.status(404).json({ error: 'Plan not found' });
+    const plan = plans[0];
+
+    // an unexpired membership is extended from its end date, not from today
+    const [latest] = await pool.query(
+      `SELECT DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS v
+       FROM payments WHERE member_id = ? AND gym_id = ?`,
+      [req.params.id, req.gymId]
+    );
+    const current = latest[0].v;
+    const start = current && current > paidOn ? current : paidOn;
+    const validUntil = addMonths(start, plan.duration_months);
+
+    const [result] = await pool.query(
+      `INSERT INTO payments
+       (gym_id, member_id, plan_id, plan_name, amount, paid_on, valid_until, note)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [req.gymId, req.params.id, plan.id, plan.name, plan.amount, paidOn, validUntil, note || null]
+    );
+    const [rows] = await pool.query(
+      `SELECT ${PAYMENT_COLUMNS} FROM payments WHERE id = ?`,
+      [result.insertId]
+    );
+    res.status(201).json({ payment: serializePayment(rows[0]), valid_until: validUntil });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/payments/:id', auth, async (req, res) => {
+  try {
+    const [result] = await pool.query(
+      'DELETE FROM payments WHERE id = ? AND gym_id = ?',
+      [req.params.id, req.gymId]
+    );
+    if (result.affectedRows === 0)
+      return res.status(404).json({ error: 'Payment not found' });
+    res.json({ message: 'Payment deleted' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

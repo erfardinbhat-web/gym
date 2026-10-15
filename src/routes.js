@@ -48,6 +48,7 @@ function serializeMember(m) {
     joined_on: formatDate(m.joined_on),
     photo_url: m.photo_url,
     aadhaar_url: m.aadhaar_url,
+    valid_until: m.valid_until || null,
   };
 }
 
@@ -246,7 +247,10 @@ router.get('/members', auth, async (req, res) => {
     }
 
     const [members] = await pool.query(
-      `SELECT * FROM members ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      `SELECT members.*,
+        (SELECT DATE_FORMAT(MAX(p.valid_until), '%Y-%m-%d') FROM payments p
+         WHERE p.member_id = members.id AND p.gym_id = members.gym_id) AS valid_until
+       FROM members ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
       [...params, pageSize, offset]
     );
     const [countResult] = await pool.query(

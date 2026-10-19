@@ -60,6 +60,17 @@ function signToken(gymId) {
   );
 }
 
+// ---------- HEALTH ----------
+
+router.get('/ping', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false });
+  }
+});
+
 // ---------- AUTH ----------
 
 router.post('/auth/register', async (req, res) => {

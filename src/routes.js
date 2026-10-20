@@ -244,28 +244,56 @@ router.post('/members', auth, memberFiles, async (req, res) => {
 router.get('/members', auth, async (req, res) => {
   try {
     const search = (req.query.search || '').trim();
+    const filter = (req.query.filter || '').trim();
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const pageSize = Math.min(100, parseInt(req.query.page_size || req.query.pageSize) || 25);
     const offset = (page - 1) * pageSize;
     const gymId = req.gymId;
 
-    let where = 'WHERE gym_id = ?';
+    const today = isValidDate(req.query.today)
+      ? req.query.today
+      : new Date().toISOString().slice(0, 10);
+    const soon = today;
+    const weekEnd = new Date(today + 'T00:00:00Z');
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 7);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
+    let inner = 'WHERE m.gym_id = ?';
     const params = [gymId];
     if (search) {
-      where += ' AND (name LIKE ? OR phone LIKE ? OR member_code LIKE ?)';
+      inner += ' AND (m.name LIKE ? OR m.phone LIKE ? OR m.member_code LIKE ?)';
       const term = `%${search}%`;
       params.push(term, term, term);
     }
 
+    let outer = '';
+    if (filter === 'active') {
+      outer = 'WHERE valid_until >= ?';
+      params.push(soon);
+    } else if (filter === 'expiring') {
+      outer = 'WHERE valid_until >= ? AND valid_until <= ?';
+      params.push(soon, weekEndStr);
+    } else if (filter === 'expired') {
+      outer = 'WHERE valid_until < ?';
+      params.push(soon);
+    } else if (filter === 'none') {
+      outer = 'WHERE valid_until IS NULL';
+    }
+
+    const base = `
+      SELECT t.* FROM (
+        SELECT m.*,
+          (SELECT DATE_FORMAT(MAX(p.valid_until), '%Y-%m-%d') FROM payments p
+           WHERE p.member_id = m.id AND p.gym_id = m.gym_id) AS valid_until
+        FROM members m ${inner}
+      ) t ${outer}`;
+
     const [members] = await pool.query(
-      `SELECT members.*,
-        (SELECT DATE_FORMAT(MAX(p.valid_until), '%Y-%m-%d') FROM payments p
-         WHERE p.member_id = members.id AND p.gym_id = members.gym_id) AS valid_until
-       FROM members ${where} ORDER BY id DESC LIMIT ? OFFSET ?`,
+      `${base} ORDER BY t.id DESC LIMIT ? OFFSET ?`,
       [...params, pageSize, offset]
     );
     const [countResult] = await pool.query(
-      `SELECT COUNT(*) AS total FROM members ${where}`,
+      `SELECT COUNT(*) AS total FROM (${base}) c`,
       params
     );
     const total = countResult[0].total;

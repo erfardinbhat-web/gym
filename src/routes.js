@@ -518,7 +518,7 @@ function addMonths(dateStr, months) {
 
 const PAYMENT_COLUMNS = `id, plan_id, plan_name, amount,
   DATE_FORMAT(paid_on, '%Y-%m-%d') AS paid_on,
-  DATE_FORMAT(valid_until, '%Y-%m-%d') AS valid_until, note`;
+  DATE_FORMAT(valid_until, '%Y-%m-%d') AS valid_until, note, method, receipt_no`;
 
 function serializePayment(p) {
   return {
@@ -529,7 +529,42 @@ function serializePayment(p) {
     paid_on: p.paid_on,
     valid_until: p.valid_until,
     note: p.note,
+    method: p.method || 'cash',
+    receipt_no: p.receipt_no || null,
   };
+}
+
+const PAYMENT_METHODS = ['cash', 'upi', 'card'];
+
+// adds the newer payment columns on servers created before they existed
+(async () => {
+  try {
+    const [m] = await pool.query("SHOW COLUMNS FROM payments LIKE 'method'");
+    if (m.length === 0) {
+      await pool.query(
+        "ALTER TABLE payments ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT 'cash'"
+      );
+    }
+    const [r] = await pool.query("SHOW COLUMNS FROM payments LIKE 'receipt_no'");
+    if (r.length === 0) {
+      await pool.query('ALTER TABLE payments ADD COLUMN receipt_no VARCHAR(20) NULL');
+      await pool.query(
+        'ALTER TABLE payments ADD UNIQUE INDEX uq_receipt (gym_id, receipt_no)'
+      );
+    }
+  } catch (e) {
+    console.error('Payment columns check failed:', e.message);
+  }
+})();
+
+async function nextReceiptNo(gymId, year) {
+  const prefix = `RCP-${year}-`;
+  const [rows] = await pool.query(
+    `SELECT MAX(CAST(SUBSTRING(receipt_no, ?) AS UNSIGNED)) AS n
+     FROM payments WHERE gym_id = ? AND receipt_no LIKE ?`,
+    [prefix.length + 1, gymId, prefix + '%']
+  );
+  return prefix + String((rows[0].n || 0) + 1).padStart(4, '0');
 }
 
 async function memberBelongsToGym(memberId, gymId) {
@@ -568,7 +603,10 @@ router.post('/members/:id/payments', auth, async (req, res) => {
     const planId = parseInt(body.plan_id, 10);
     const note = (body.note || '').trim().slice(0, 255);
     const paidOn = (body.paid_on || new Date().toISOString().slice(0, 10)).trim();
+    const method = (body.method || 'cash').toString().toLowerCase();
 
+    if (!PAYMENT_METHODS.includes(method))
+      return res.status(400).json({ error: 'Invalid payment method' });
     if (!planId) return res.status(400).json({ error: 'Select a plan' });
     if (!isValidDate(paidOn))
       return res.status(400).json({ error: 'Invalid payment date' });
@@ -593,12 +631,21 @@ router.post('/members/:id/payments', auth, async (req, res) => {
     const start = current && current > paidOn ? current : paidOn;
     const validUntil = addMonths(start, plan.duration_months);
 
-    const [result] = await pool.query(
-      `INSERT INTO payments
-       (gym_id, member_id, plan_id, plan_name, amount, paid_on, valid_until, note)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [req.gymId, req.params.id, plan.id, plan.name, plan.amount, paidOn, validUntil, note || null]
-    );
+    let result;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const receiptNo = await nextReceiptNo(req.gymId, paidOn.slice(0, 4));
+      try {
+        [result] = await pool.query(
+          `INSERT INTO payments
+           (gym_id, member_id, plan_id, plan_name, amount, paid_on, valid_until, note, method, receipt_no)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [req.gymId, req.params.id, plan.id, plan.name, plan.amount, paidOn, validUntil, note || null, method, receiptNo]
+        );
+        break;
+      } catch (err) {
+        if (err.code !== 'ER_DUP_ENTRY' || attempt === 2) throw err;
+      }
+    }
     const [rows] = await pool.query(
       `SELECT ${PAYMENT_COLUMNS} FROM payments WHERE id = ?`,
       [result.insertId]

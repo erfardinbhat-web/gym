@@ -670,4 +670,70 @@ router.delete('/payments/:id', auth, async (req, res) => {
   }
 });
 
+(async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      gym_id INT NOT NULL,
+      member_id INT NOT NULL,
+      day DATE NOT NULL,
+      checked_in_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_att (gym_id, member_id, day),
+      KEY idx_att_day (gym_id, day)
+    )`);
+  } catch (e) {
+    console.error('attendance table', e.message);
+  }
+})();
+
+router.get('/dashboard', auth, async (req, res) => {
+  try {
+    const re = /^\d{4}-\d{2}-\d{2}$/;
+    const today = re.test(req.query.today || '') ? req.query.today : null;
+    if (!today) return res.status(400).json({ error: 'today is required' });
+
+    const gid = req.gymId;
+    const [[tot]] = await pool.query(
+      'SELECT COUNT(*) AS c FROM members WHERE gym_id = ?',
+      [gid]
+    );
+    const [[act]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM (
+         SELECT member_id FROM payments WHERE gym_id = ?
+         GROUP BY member_id HAVING MAX(valid_until) >= ?
+       ) t`,
+      [gid, today]
+    );
+    const [[exp]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM (
+         SELECT member_id FROM payments WHERE gym_id = ?
+         GROUP BY member_id
+         HAVING MAX(valid_until) >= ? AND MAX(valid_until) <= DATE_ADD(?, INTERVAL 7 DAY)
+       ) t`,
+      [gid, today, today]
+    );
+    const monthStart = today.slice(0, 8) + '01';
+    const [[rev]] = await pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS s FROM payments
+       WHERE gym_id = ? AND paid_on >= ?
+         AND paid_on < DATE_ADD(?, INTERVAL 1 MONTH)`,
+      [gid, monthStart, monthStart]
+    );
+    const [[chk]] = await pool.query(
+      'SELECT COUNT(*) AS c FROM attendance WHERE gym_id = ? AND day = ?',
+      [gid, today]
+    );
+
+    res.json({
+      total_members: tot.c,
+      active_members: act.c,
+      expiring_week: exp.c,
+      month_revenue: Number(rev.s),
+      today_checkins: chk.c,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

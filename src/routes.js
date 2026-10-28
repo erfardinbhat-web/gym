@@ -34,7 +34,6 @@ function formatDate(d) {
   return dt.toISOString().slice(0, 10);
 }
 
-// Response shape the Flutter Member model expects (snake_case)
 function serializeMember(m) {
   return {
     id: m.id,
@@ -536,7 +535,6 @@ function serializePayment(p) {
 
 const PAYMENT_METHODS = ['cash', 'upi', 'card'];
 
-// adds the newer payment columns on servers created before they existed
 (async () => {
   try {
     const [m] = await pool.query("SHOW COLUMNS FROM payments LIKE 'method'");
@@ -621,7 +619,6 @@ router.post('/members/:id/payments', auth, async (req, res) => {
       return res.status(404).json({ error: 'Plan not found' });
     const plan = plans[0];
 
-    // an unexpired membership is extended from its end date, not from today
     const [latest] = await pool.query(
       `SELECT DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS v
        FROM payments WHERE member_id = ? AND gym_id = ?`,
@@ -670,6 +667,8 @@ router.delete('/payments/:id', auth, async (req, res) => {
   }
 });
 
+// ---------- ATTENDANCE ----------
+
 (async () => {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
@@ -685,6 +684,75 @@ router.delete('/payments/:id', auth, async (req, res) => {
     console.error('attendance table', e.message);
   }
 })();
+
+// POST /attendance/checkin
+// Body: { member_id: int, today: 'yyyy-MM-dd' }
+// Returns: { status: 'active'|'expired'|'no_plan', member_name, valid_until, already_checked_in }
+router.post('/attendance/checkin', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const memberId = parseInt(body.member_id, 10);
+    const today = isValidDate(body.today || '')
+      ? body.today
+      : new Date().toISOString().slice(0, 10);
+
+    if (!memberId)
+      return res.status(400).json({ error: 'member_id is required' });
+
+    const [members] = await pool.query(
+      'SELECT id, name FROM members WHERE id = ? AND gym_id = ?',
+      [memberId, req.gymId]
+    );
+    if (members.length === 0)
+      return res.status(404).json({ error: 'Member not found' });
+
+    const member = members[0];
+
+    const [[latest]] = await pool.query(
+      `SELECT DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS valid_until
+       FROM payments WHERE member_id = ? AND gym_id = ?`,
+      [memberId, req.gymId]
+    );
+    const validUntil = latest.valid_until || null;
+
+    let memberStatus;
+    if (!validUntil) {
+      memberStatus = 'no_plan';
+    } else if (validUntil >= today) {
+      memberStatus = 'active';
+    } else {
+      memberStatus = 'expired';
+    }
+
+    // only log attendance if active
+    let alreadyCheckedIn = false;
+    if (memberStatus === 'active') {
+      try {
+        await pool.query(
+          'INSERT INTO attendance (gym_id, member_id, day) VALUES (?, ?, ?)',
+          [req.gymId, memberId, today]
+        );
+      } catch (e) {
+        if (e.code === 'ER_DUP_ENTRY') {
+          alreadyCheckedIn = true;
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    res.json({
+      status: memberStatus,
+      member_name: member.name,
+      valid_until: validUntil,
+      already_checked_in: alreadyCheckedIn,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- DASHBOARD ----------
 
 router.get('/dashboard', auth, async (req, res) => {
   try {

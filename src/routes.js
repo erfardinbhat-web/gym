@@ -95,11 +95,7 @@ router.post('/auth/register', async (req, res) => {
     );
 
     res.status(200).json({
-      gym: {
-        id: result.insertId,
-        gym_name: gymName,
-        email
-      },
+      gym: { id: result.insertId, gym_name: gymName, email },
       token: signToken(result.insertId),
     });
   } catch (e) {
@@ -126,11 +122,7 @@ router.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
 
     res.json({
-      gym: {
-        id: gym.id,
-        gym_name: gym.name,
-        email: gym.email,
-      },
+      gym: { id: gym.id, gym_name: gym.name, email: gym.email },
       token: signToken(gym.id),
     });
   } catch (e) {
@@ -303,6 +295,36 @@ router.get('/members', auth, async (req, res) => {
       page,
       has_more: offset + members.length < total,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/members/dues', auth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const gymId = req.gymId;
+
+    const [rows] = await pool.query(
+      `SELECT m.id, m.member_code, m.name, m.phone,
+         DATE_FORMAT(MAX(p.valid_until), '%Y-%m-%d') AS valid_until
+       FROM members m
+       LEFT JOIN payments p ON p.member_id = m.id AND p.gym_id = m.gym_id
+       WHERE m.gym_id = ?
+       GROUP BY m.id, m.member_code, m.name, m.phone
+       HAVING valid_until IS NULL OR valid_until < ?
+       ORDER BY valid_until ASC, m.name ASC
+       LIMIT 100`,
+      [gymId, today]
+    );
+
+    res.json({ dues: rows.map(r => ({
+      id: r.id,
+      member_code: r.member_code,
+      name: r.name,
+      phone: r.phone,
+      valid_until: r.valid_until || null,
+    }))});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -685,9 +707,23 @@ router.delete('/payments/:id', auth, async (req, res) => {
   }
 })();
 
-// POST /attendance/checkin
-// Body: { member_id: int, today: 'yyyy-MM-dd' }
-// Returns: { status: 'active'|'expired'|'no_plan', member_name, valid_until, already_checked_in }
+(async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS membership_freezes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      gym_id INT NOT NULL,
+      member_id INT NOT NULL,
+      frozen_on DATE NOT NULL,
+      freeze_days INT NOT NULL,
+      new_valid_until DATE NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_freeze_member (gym_id, member_id)
+    )`);
+  } catch (e) {
+    console.error('membership_freezes table', e.message);
+  }
+})();
+
 router.post('/attendance/checkin', auth, async (req, res) => {
   try {
     const body = req.body || {};
@@ -724,7 +760,6 @@ router.post('/attendance/checkin', auth, async (req, res) => {
       memberStatus = 'expired';
     }
 
-    // only log attendance if active
     let alreadyCheckedIn = false;
     if (memberStatus === 'active') {
       try {
@@ -747,6 +782,74 @@ router.post('/attendance/checkin', auth, async (req, res) => {
       valid_until: validUntil,
       already_checked_in: alreadyCheckedIn,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/attendance/member/:id', auth, async (req, res) => {
+  try {
+    if (!(await memberBelongsToGym(req.params.id, req.gymId)))
+      return res.status(404).json({ error: 'Member not found' });
+
+    const [rows] = await pool.query(
+      `SELECT DATE_FORMAT(day, '%Y-%m-%d') AS day
+       FROM attendance
+       WHERE member_id = ? AND gym_id = ?
+       ORDER BY day DESC
+       LIMIT 90`,
+      [req.params.id, req.gymId]
+    );
+
+    res.json({ days: rows.map(r => r.day) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/members/:id/freeze', auth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const freezeDays = parseInt(body.freeze_days, 10);
+
+    if (!freezeDays || freezeDays < 1 || freezeDays > 365)
+      return res.status(400).json({ error: 'freeze_days must be between 1 and 365' });
+
+    if (!(await memberBelongsToGym(req.params.id, req.gymId)))
+      return res.status(404).json({ error: 'Member not found' });
+
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [[latest]] = await pool.query(
+      `SELECT id, DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS valid_until
+       FROM payments WHERE member_id = ? AND gym_id = ?`,
+      [req.params.id, req.gymId]
+    );
+
+    if (!latest.valid_until || latest.valid_until < today)
+      return res.status(400).json({ error: 'No active membership to freeze' });
+
+    // extend valid_until by freeze_days on all payments for this member (extend the max)
+    const currentEnd = latest.valid_until;
+    const newEnd = new Date(currentEnd + 'T00:00:00Z');
+    newEnd.setUTCDate(newEnd.getUTCDate() + freezeDays);
+    const newEndStr = newEnd.toISOString().slice(0, 10);
+
+    // update the latest payment's valid_until
+    await pool.query(
+      `UPDATE payments SET valid_until = ?
+       WHERE member_id = ? AND gym_id = ?
+         AND DATE_FORMAT(valid_until, '%Y-%m-%d') = ?`,
+      [newEndStr, req.params.id, req.gymId, currentEnd]
+    );
+
+    await pool.query(
+      `INSERT INTO membership_freezes (gym_id, member_id, frozen_on, freeze_days, new_valid_until)
+       VALUES (?, ?, ?, ?, ?)`,
+      [req.gymId, req.params.id, today, freezeDays, newEndStr]
+    );
+
+    res.json({ valid_until: newEndStr, freeze_days: freezeDays });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -799,6 +902,59 @@ router.get('/dashboard', auth, async (req, res) => {
       month_revenue: Number(rev.s),
       today_checkins: chk.c,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/dashboard/revenue-chart', auth, async (req, res) => {
+  try {
+    const gid = req.gymId;
+    const [rows] = await pool.query(
+      `SELECT
+         DATE_FORMAT(paid_on, '%Y-%m') AS month_key,
+         DATE_FORMAT(MIN(paid_on), '%b %Y') AS label,
+         COALESCE(SUM(amount), 0) AS amount
+       FROM payments
+       WHERE gym_id = ?
+         AND paid_on >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 5 MONTH), '%Y-%m-01')
+       GROUP BY month_key
+       ORDER BY month_key ASC`,
+      [gid]
+    );
+
+    res.json({ months: rows.map(r => ({ label: r.label, amount: Number(r.amount) })) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/dashboard/expiring', auth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const weekEnd = new Date(today + 'T00:00:00Z');
+    weekEnd.setUTCDate(weekEnd.getUTCDate() + 7);
+    const weekEndStr = weekEnd.toISOString().slice(0, 10);
+
+    const [rows] = await pool.query(
+      `SELECT m.id, m.member_code, m.name, m.phone,
+         DATE_FORMAT(MAX(p.valid_until), '%Y-%m-%d') AS valid_until
+       FROM members m
+       JOIN payments p ON p.member_id = m.id AND p.gym_id = m.gym_id
+       WHERE m.gym_id = ?
+       GROUP BY m.id, m.member_code, m.name, m.phone
+       HAVING valid_until >= ? AND valid_until <= ?
+       ORDER BY valid_until ASC`,
+      [req.gymId, today, weekEndStr]
+    );
+
+    res.json({ members: rows.map(r => ({
+      id: r.id,
+      member_code: r.member_code,
+      name: r.name,
+      phone: r.phone,
+      valid_until: r.valid_until,
+    }))});
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

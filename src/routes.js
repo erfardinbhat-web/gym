@@ -232,6 +232,58 @@ router.post('/members', auth, memberFiles, async (req, res) => {
   }
 });
 
+// FR-5: real-time phone duplicate check
+router.get('/members/check-phone', auth, async (req, res) => {
+  try {
+    const phone = (req.query.phone || '').trim();
+    const excludeId = req.query.exclude_id ? parseInt(req.query.exclude_id) : null;
+    if (!phone) return res.json({ exists: false });
+    let query = 'SELECT id, name, member_code FROM members WHERE phone = ? AND gym_id = ?';
+    const params = [phone, req.gymId];
+    if (excludeId) { query += ' AND id != ?'; params.push(excludeId); }
+    const [rows] = await pool.query(query, params);
+    if (rows.length > 0) {
+      return res.json({ exists: true, member: { id: rows[0].id, name: rows[0].name, member_code: rows[0].member_code } });
+    }
+    res.json({ exists: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// FR-25: attendance report with date range
+router.get('/attendance/report', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to dates required' });
+    const [rows] = await pool.query(
+      `SELECT m.id, m.name, m.member_code, m.phone,
+              COUNT(a.id) AS total_days,
+              GROUP_CONCAT(DATE_FORMAT(a.day, '%Y-%m-%d') ORDER BY a.day ASC SEPARATOR ',') AS days
+       FROM members m
+       LEFT JOIN attendance a
+         ON a.member_id = m.id AND a.gym_id = m.gym_id AND a.day BETWEEN ? AND ?
+       WHERE m.gym_id = ?
+       GROUP BY m.id, m.name, m.member_code, m.phone
+       ORDER BY total_days DESC, m.name ASC`,
+      [from, to, req.gymId]
+    );
+    res.json({
+      from, to,
+      members: rows.map(r => ({
+        id: r.id,
+        name: r.name,
+        member_code: r.member_code,
+        phone: r.phone,
+        total_days: r.total_days || 0,
+        days: r.days ? r.days.split(',') : [],
+      }))
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.get('/members', auth, async (req, res) => {
   try {
     const search = (req.query.search || '').trim();

@@ -910,6 +910,7 @@ router.get('/dashboard', auth, async (req, res) => {
 router.get('/dashboard/revenue-chart', auth, async (req, res) => {
   try {
     const gid = req.gymId;
+    // Rolling 12 months — works across year boundaries automatically
     const [rows] = await pool.query(
       `SELECT
          DATE_FORMAT(paid_on, '%Y-%m') AS month_key,
@@ -917,13 +918,19 @@ router.get('/dashboard/revenue-chart', auth, async (req, res) => {
          COALESCE(SUM(amount), 0) AS amount
        FROM payments
        WHERE gym_id = ?
-         AND paid_on >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 5 MONTH), '%Y-%m-01')
+         AND paid_on >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 11 MONTH), '%Y-%m-01')
        GROUP BY month_key
        ORDER BY month_key ASC`,
       [gid]
     );
 
-    res.json({ months: rows.map(r => ({ label: r.label, amount: Number(r.amount) })) });
+    res.json({
+      months: rows.map(r => ({
+        month_key: r.month_key,   // "2025-10" — used for year grouping in Flutter
+        label: r.label,           // "Oct 2025"
+        amount: Number(r.amount)
+      }))
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

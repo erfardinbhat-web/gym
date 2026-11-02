@@ -7,7 +7,7 @@ const pool = mysql.createPool({
   password: 'a0d7312e83a0ee9b1abc2d044094f9e3a1c8b3db',
   database: 'gymdb_shelterbus',
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: 4,
   queueLimit: 0,
   timezone: '+00:00',
 });

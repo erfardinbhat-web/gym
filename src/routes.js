@@ -873,7 +873,7 @@ router.post('/members/:id/freeze', auth, async (req, res) => {
     const today = new Date().toISOString().slice(0, 10);
 
     const [[latest]] = await pool.query(
-      `SELECT id, DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS valid_until
+      `SELECT DATE_FORMAT(MAX(valid_until), '%Y-%m-%d') AS valid_until
        FROM payments WHERE member_id = ? AND gym_id = ?`,
       [req.params.id, req.gymId]
     );

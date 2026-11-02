@@ -257,7 +257,7 @@ router.get('/attendance/report', auth, async (req, res) => {
     const { from, to } = req.query;
     if (!from || !to) return res.status(400).json({ error: 'from and to dates required' });
     const [rows] = await pool.query(
-      `SELECT m.id, m.name, m.member_code, m.phone,
+      `SELECT m.id, m.name, m.member_code, CAST(m.phone AS CHAR) AS phone,
               COUNT(a.id) AS total_days,
               GROUP_CONCAT(DATE_FORMAT(a.day, '%Y-%m-%d') ORDER BY a.day ASC SEPARATOR ',') AS days
        FROM members m

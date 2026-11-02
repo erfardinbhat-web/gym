@@ -1,16 +1,15 @@
 const mysql = require('mysql2/promise');
-require('dotenv').config();
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  port: Number(process.env.DB_PORT) || 3306,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
+  host: 'v7qas8.h.filess.io',
+  port: 3306,
+  user: 'gymdb_shelterbus',
+  password: 'a0d7312e83a0ee9b1abc2d044094f9e3a1c8b3db',
+  database: 'gymdb_shelterbus',
   waitForConnections: true,
-  connectionLimit: 5,
-  // Aiven requires SSL; set DB_SSL=true on the host
-  ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+  connectionLimit: 10,
+  queueLimit: 0,
+  timezone: '+00:00',
 });
 
 module.exports = pool;

@@ -59,6 +59,57 @@ function signToken(gymId) {
   );
 }
 
+// ---------- STARTUP MIGRATIONS (sequential, one connection) ----------
+
+async function runStartupMigrations() {
+  try {
+    // 1. attendance table
+    await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      gym_id INT NOT NULL,
+      member_id INT NOT NULL,
+      day DATE NOT NULL,
+      checked_in_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_att (gym_id, member_id, day),
+      KEY idx_att_day (gym_id, day)
+    )`);
+
+    // 2. membership_freezes table
+    await pool.query(`CREATE TABLE IF NOT EXISTS membership_freezes (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      gym_id INT NOT NULL,
+      member_id INT NOT NULL,
+      frozen_on DATE NOT NULL,
+      freeze_days INT NOT NULL,
+      new_valid_until DATE NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      KEY idx_freeze_member (gym_id, member_id)
+    )`);
+
+    // 3. payments.method column
+    const [m] = await pool.query("SHOW COLUMNS FROM payments LIKE 'method'");
+    if (m.length === 0) {
+      await pool.query(
+        "ALTER TABLE payments ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT 'cash'"
+      );
+    }
+
+    // 4. payments.receipt_no column
+    const [r] = await pool.query("SHOW COLUMNS FROM payments LIKE 'receipt_no'");
+    if (r.length === 0) {
+      await pool.query('ALTER TABLE payments ADD COLUMN receipt_no VARCHAR(20) NULL');
+      await pool.query(
+        'ALTER TABLE payments ADD UNIQUE INDEX uq_receipt (gym_id, receipt_no)'
+      );
+    }
+  } catch (e) {
+    console.error('Startup migrations failed:', e.message);
+  }
+}
+
+// Run once, non-blocking — server is ready immediately after this resolves
+runStartupMigrations();
+
 // ---------- HEALTH ----------
 
 router.get('/ping', async (req, res) => {
@@ -609,26 +660,6 @@ function serializePayment(p) {
 
 const PAYMENT_METHODS = ['cash', 'upi', 'card'];
 
-(async () => {
-  try {
-    const [m] = await pool.query("SHOW COLUMNS FROM payments LIKE 'method'");
-    if (m.length === 0) {
-      await pool.query(
-        "ALTER TABLE payments ADD COLUMN method VARCHAR(10) NOT NULL DEFAULT 'cash'"
-      );
-    }
-    const [r] = await pool.query("SHOW COLUMNS FROM payments LIKE 'receipt_no'");
-    if (r.length === 0) {
-      await pool.query('ALTER TABLE payments ADD COLUMN receipt_no VARCHAR(20) NULL');
-      await pool.query(
-        'ALTER TABLE payments ADD UNIQUE INDEX uq_receipt (gym_id, receipt_no)'
-      );
-    }
-  } catch (e) {
-    console.error('Payment columns check failed:', e.message);
-  }
-})();
-
 async function nextReceiptNo(gymId, year) {
   const prefix = `RCP-${year}-`;
   const [rows] = await pool.query(
@@ -743,39 +774,6 @@ router.delete('/payments/:id', auth, async (req, res) => {
 
 // ---------- ATTENDANCE ----------
 
-(async () => {
-  try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS attendance (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      gym_id INT NOT NULL,
-      member_id INT NOT NULL,
-      day DATE NOT NULL,
-      checked_in_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_att (gym_id, member_id, day),
-      KEY idx_att_day (gym_id, day)
-    )`);
-  } catch (e) {
-    console.error('attendance table', e.message);
-  }
-})();
-
-(async () => {
-  try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS membership_freezes (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      gym_id INT NOT NULL,
-      member_id INT NOT NULL,
-      frozen_on DATE NOT NULL,
-      freeze_days INT NOT NULL,
-      new_valid_until DATE NOT NULL,
-      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      KEY idx_freeze_member (gym_id, member_id)
-    )`);
-  } catch (e) {
-    console.error('membership_freezes table', e.message);
-  }
-})();
-
 router.post('/attendance/checkin', auth, async (req, res) => {
   try {
     const body = req.body || {};
@@ -881,13 +879,11 @@ router.post('/members/:id/freeze', auth, async (req, res) => {
     if (!latest.valid_until || latest.valid_until < today)
       return res.status(400).json({ error: 'No active membership to freeze' });
 
-    // extend valid_until by freeze_days on all payments for this member (extend the max)
     const currentEnd = latest.valid_until;
     const newEnd = new Date(currentEnd + 'T00:00:00Z');
     newEnd.setUTCDate(newEnd.getUTCDate() + freezeDays);
     const newEndStr = newEnd.toISOString().slice(0, 10);
 
-    // update the latest payment's valid_until
     await pool.query(
       `UPDATE payments SET valid_until = ?
        WHERE member_id = ? AND gym_id = ?
@@ -962,7 +958,6 @@ router.get('/dashboard', auth, async (req, res) => {
 router.get('/dashboard/revenue-chart', auth, async (req, res) => {
   try {
     const gid = req.gymId;
-    // Rolling 12 months — works across year boundaries automatically
     const [rows] = await pool.query(
       `SELECT
          DATE_FORMAT(paid_on, '%Y-%m') AS month_key,
@@ -978,8 +973,8 @@ router.get('/dashboard/revenue-chart', auth, async (req, res) => {
 
     res.json({
       months: rows.map(r => ({
-        month_key: r.month_key,   // "2025-10" — used for year grouping in Flutter
-        label: r.label,           // "Oct 2025"
+        month_key: r.month_key,
+        label: r.label,
         amount: Number(r.amount)
       }))
     });
